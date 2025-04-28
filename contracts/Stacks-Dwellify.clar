@@ -141,3 +141,175 @@
               is-available: (not (get is-available property))
             }))))
       err-not-found)))
+
+;; Rent the property
+(define-public (rent-property (property-id uint))
+  (begin
+    (asserts! (> property-id u0) err-invalid-property-id)
+    (match (map-get? properties { property-id: property-id })
+      property
+        (let (
+          (total-cost (+ (get rental-price property) (get security-deposit property)))
+          (fee (/ (* (get rental-price property) (var-get platform-fee-percentage)) u100))
+        )
+          (begin
+            (asserts! (var-get contract-initialized) err-not-initialized)
+            (asserts! (get available property) err-already-rented)
+            (asserts! (get is-available property) err-unavailable)
+            (asserts! (>= (stx-get-balance tx-sender) total-cost) err-insufficient-funds)
+            (try! (stx-transfer? (get rental-price property) tx-sender (get owner property)))
+            (try! (stx-transfer? fee tx-sender contract-owner))
+            (try! (stx-transfer? (get security-deposit property) tx-sender (var-get escrow-address)))
+            (ok (map-set properties
+              { property-id: property-id }
+              (merge property {
+                available: false,
+                tenant: (some tx-sender),
+                lease-start-time: block-height
+              })))))
+      err-not-found)))
+
+;; End the lease
+(define-public (end-lease (property-id uint))
+  (begin
+    (asserts! (> property-id u0) err-invalid-property-id)
+    (match (map-get? properties { property-id: property-id })
+      property
+        (let ((tenant (get tenant property)))
+          (begin
+            (asserts! (or (is-eq tx-sender (get owner property)) (is-eq (some tx-sender) tenant)) err-unauthorized)
+            (asserts! (>= block-height (+ (get lease-start-time property) (get rental-duration property))) err-lease-not-expired)
+            (try! (as-contract (stx-transfer? (get security-deposit property) (var-get escrow-address) (unwrap-panic tenant))))
+            (ok (map-set properties
+              { property-id: property-id }
+              (merge property {
+                available: true,
+                tenant: none,
+                lease-start-time: u0
+              })))))
+      err-not-found)))
+
+;; Extend lease
+(define-public (extend-lease (property-id uint) (extension-duration uint))
+  (begin
+    (asserts! (> property-id u0) err-invalid-property-id)
+    (asserts! (> extension-duration u0) err-invalid-duration)
+    (match (map-get? properties { property-id: property-id })
+      property
+        (begin
+          (asserts! (is-eq (some tx-sender) (get tenant property)) err-not-tenant)
+          (let (
+            (new-end-time (+ (get lease-start-time property) (get rental-duration property) extension-duration))
+            (extension-cost (* (get rental-price property) (/ extension-duration (get rental-duration property))))
+            (fee (/ (* extension-cost (var-get platform-fee-percentage)) u100))
+          )
+            (begin
+              (try! (stx-transfer? extension-cost tx-sender (get owner property)))
+              (try! (stx-transfer? fee tx-sender contract-owner))
+              (ok (map-set properties
+                { property-id: property-id }
+                (merge property {
+                  rental-duration: (+ (get rental-duration property) extension-duration)
+                }))))))
+      err-not-found)))
+
+;; Rate a property
+(define-public (rate-property (property-id uint) (rating uint))
+  (begin
+    (asserts! (> property-id u0) err-invalid-property-id)
+    (asserts! (and (>= rating u1) (<= rating u5)) err-invalid-rating)
+    (match (map-get? properties { property-id: property-id })
+      property
+        (let (
+          (user-rating (default-to { total-rating: u0, count: u0, last-rating-time: u0 } (map-get? user-ratings { user: tx-sender })))
+        )
+          (begin
+            (asserts! (is-eq (some tx-sender) (get tenant property)) err-not-tenant)
+            (asserts! (> block-height (+ (get last-rating-time user-rating) u144)) err-rating-cooldown) ;; 1 day cooldown
+            (map-set properties
+              { property-id: property-id }
+              (merge property { rating: rating }))
+            (ok (map-set user-ratings
+              { user: tx-sender }
+              {
+                total-rating: (+ (get total-rating user-rating) rating),
+                count: (+ (get count user-rating) u1),
+                last-rating-time: block-height
+              }))))
+      err-not-found)))
+;; Rate a user (can be tenant or owner)
+(define-public (rate-user (user principal) (rating uint))
+  (let (
+    (user-rating (default-to { total-rating: u0, count: u0, last-rating-time: u0 } (map-get? user-ratings { user: user })))
+  )
+    (begin
+      (asserts! (and (>= rating u1) (<= rating u5)) err-invalid-rating)
+      (asserts! (> block-height (+ (get last-rating-time user-rating) u144)) err-rating-cooldown) ;; 1 day cooldown
+      (ok (map-set user-ratings
+        { user: user }
+        {
+          total-rating: (+ (get total-rating user-rating) rating),
+          count: (+ (get count user-rating) u1),
+          last-rating-time: block-height
+        })))))
+
+;; Verify a user
+(define-public (verify-user (user principal))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (ok (map-set user-verification { user: user } { verified: true }))))
+
+;; Get property details
+(define-read-only (get-property-details (property-id uint))
+  (match (map-get? properties { property-id: property-id })
+    property (ok property)
+    err-not-found))
+
+;; Get user rating
+(define-read-only (get-user-rating (user principal))
+  (match (map-get? user-ratings { user: user })
+    rating (ok (if (is-eq (get count rating) u0)
+                 u0
+                 (/ (get total-rating rating) (get count rating))))
+    (ok u0)))
+
+;; Get total properties
+(define-read-only (get-total-properties)
+  (ok (var-get total-properties)))
+
+;; Get remaining lease time
+(define-read-only (get-remaining-lease-time (property-id uint))
+  (match (map-get? properties { property-id: property-id })
+    property
+      (let (
+        (tenant (get tenant property))
+        (lease-start (get lease-start-time property))
+        (duration (get rental-duration property))
+      )
+        (ok (if (is-some tenant)
+              (if (> (+ lease-start duration) block-height)
+                (- (+ lease-start duration) block-height)
+                u0)
+              u0)))
+    err-not-found))
+
+;; Check if the contract is initialized
+(define-read-only (is-initialized)
+  (ok (var-get contract-initialized)))
+
+;; Check if a user is verified
+(define-read-only (is-user-verified (user principal))
+  (ok (default-to false (get verified (map-get? user-verification { user: user })))))
+
+;; Update platform fee
+(define-public (update-platform-fee (new-fee-percentage uint))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (and (>= new-fee-percentage u0) (<= new-fee-percentage u100)) err-invalid-fee)
+    (ok (var-set platform-fee-percentage new-fee-percentage))))
+
+;; Update escrow address
+(define-public (update-escrow-address (new-escrow principal))
+  (begin
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (ok (var-set escrow-address new-escrow))))
